@@ -1,0 +1,709 @@
+class_name ToolController
+extends RefCounted
+## All drawing tools. Every tool talks to the active layer only through its
+## Tiling (point_to_cell, cell_center, neighbors, cells_in_*), so tools work
+## unchanged on every tiling. Shapes are computed in canvas space, then
+## filled into whichever cells of the tiling they cover.
+
+const TOOLS := {
+	"pencil": {"name": "Pencil", "key": KEY_B},
+	"eraser": {"name": "Eraser", "key": KEY_E},
+	"eyedropper": {"name": "Eyedropper", "key": KEY_I},
+	"line": {"name": "Line", "key": KEY_L},
+	"rect": {"name": "Rectangle", "key": KEY_U},
+	"ellipse": {"name": "Ellipse", "key": KEY_O},
+	"fill": {"name": "Flood fill", "key": KEY_G},
+	"select_rect": {"name": "Rectangle select", "key": KEY_M},
+	"lasso": {"name": "Lasso select", "key": KEY_Q},
+	"wand": {"name": "Magic wand", "key": KEY_W},
+	"move": {"name": "Move", "key": KEY_V},
+	"arrow": {"name": "Arrow (direction)", "key": KEY_A},
+	"curve": {"name": "Curve (direction)", "key": KEY_C},
+	"bezier": {"name": "Bezier (direction)", "key": KEY_K},
+	"dir_edit": {"name": "Edit strokes", "key": KEY_N},
+}
+const ORDER := ["pencil", "eraser", "eyedropper", "line", "rect", "ellipse", "fill", "select_rect", "lasso", "wand", "move",
+	"arrow", "curve", "bezier", "dir_edit"]
+const DIR_TOOLS := ["arrow", "curve", "bezier", "dir_edit"]
+
+var active := false
+var erase := false
+var start := Vector2.ZERO
+var last := Vector2.ZERO
+var current := Vector2.ZERO
+var lasso := PackedVector2Array()
+var _layer: LayerData
+var _frame := 0
+var _before := PackedByteArray()
+var _tool := ""
+var _mods := {}
+var _lifted: Array = []  # [[center: Vector2, value: int], ...] for move
+var _lift_ref := Vector2.ZERO
+var _stroke := PackedVector2Array()  # direction layer stroke
+
+
+# ---- helpers ---------------------------------------------------------------
+
+func _t() -> Tiling:
+	return App.tiling_of(_layer)
+
+
+func _wrap_on() -> bool:
+	return App.wrap_draw or App.tile_preview
+
+
+func _wrap(p: Vector2) -> Vector2:
+	if not _wrap_on():
+		return p
+	var px := App.project.canvas_px()
+	return Vector2(fposmod(p.x, px.x), fposmod(p.y, px.y))
+
+
+## Mirror transforms about the canvas center (identity first).
+func _mirrors() -> Array[Transform2D]:
+	var px := App.project.canvas_px()
+	var out: Array[Transform2D] = [Transform2D.IDENTITY]
+	var fx := Transform2D(Vector2(-1, 0), Vector2(0, 1), Vector2(px.x, 0))
+	var fy := Transform2D(Vector2(1, 0), Vector2(0, -1), Vector2(0, px.y))
+	if App.mirror == 1 or App.mirror == 3:
+		out.append(fx)
+	if App.mirror == 2 or App.mirror == 3:
+		out.append(fy)
+	if App.mirror == 3:
+		out.append(fx * fy)
+	return out
+
+
+func _value() -> int:
+	return 0 if erase else App.color_index
+
+
+func _can_edit() -> bool:
+	return _layer != null and not _layer.locked and _layer.visible
+
+
+func _set_cells(cells: Array, v: int, data: PackedByteArray) -> void:
+	var t := _t()
+	var sel := App.has_selection()
+	for c in cells:
+		if not t.in_grid(c):
+			continue
+		var i := t.index(c)
+		if sel and (i >= App.selection.size() or App.selection[i] == 0):
+			continue
+		data[i] = v
+
+
+## Apply a list of canvas-space cells plus every mirror image of them.
+func _apply_mirrored(cells: Array, v: int, data: PackedByteArray) -> void:
+	var t := _t()
+	var mirrors := _mirrors()
+	var all: Array = []
+	for m in mirrors:
+		if m == Transform2D.IDENTITY:
+			all.append_array(cells)
+		else:
+			for c in cells:
+				all.append(t.point_to_cell(_wrap(m * t.cell_center(c))))
+	# OLD: _set_cells(all, v, data)
+	# WHY: with half tiles in "Full tile" mode, every brush and shape paints
+	# whole tiles, so a layer with halves on draws like before by default.
+	_set_cells(_whole_tiles(all) if _piece_mode() == 0 else all, v, data)
+
+
+## Half tiles: 0 full tile, 1 half facing the cursor, 2 one wedge. -1 when
+## the layer has no half tiles.
+func _piece_mode() -> int:
+	return int(App.tool_opts.get("piece", 0)) if _t().pieces_per_cell() > 1 else -1
+
+
+func _whole_tiles(cells: Array) -> Array:
+	var t := _t()
+	var out: Array = []
+	var seen := {}
+	for c in cells:
+		if not t.in_grid(c):
+			continue
+		var b := t.piece_base(c)
+		if seen.has(b):
+			continue
+		seen[b] = true
+		out.append_array(t.pieces_of(b))
+	return out
+
+
+func _brush_cells(p: Vector2) -> Array[Vector2i]:
+	var t := _t()
+	var size: int = App.tool_opts.brush
+	var radius := (size - 1) * t.cs * 0.5 + 0.01
+	if size <= 1:
+		var single: Array[Vector2i] = []
+		var c := t.point_to_cell(_wrap(p))
+		if t.in_grid(c):
+			# Half mode: the half of this tile that faces the cursor.
+			if _piece_mode() == 1:
+				return t.half_facing(t.piece_base(c), _wrap(p))
+			single.append(c)
+		return single
+	if not _wrap_on():
+		return t.cells_in_disc(p, radius)
+	var out: Array[Vector2i] = []
+	for off in _wrap_offsets():
+		out.append_array(t.cells_in_disc(p + off, radius))
+	return out
+
+
+func _wrap_offsets() -> Array[Vector2]:
+	var px := App.project.canvas_px()
+	var out: Array[Vector2] = [Vector2.ZERO]
+	if _wrap_on():
+		for y in [-1, 0, 1]:
+			for x in [-1, 0, 1]:
+				if x != 0 or y != 0:
+					out.append(Vector2(x * px.x, y * px.y))
+	return out
+
+
+func _segment_cells(a: Vector2, b: Vector2) -> Array[Vector2i]:
+	var t := _t()
+	var out: Array[Vector2i] = []
+	var seen := {}
+	var brush: int = App.tool_opts.brush
+	for p in t.sample_segment(a, b):
+		# OLD: if brush <= 1:
+		# WHY: with half tiles, single-cell strokes go through _brush_cells so
+		# Half mode picks the half facing each point of the stroke.
+		if brush <= 1 and t.pieces_per_cell() == 1:
+			var c := t.point_to_cell(_wrap(p))
+			if t.in_grid(c) and not seen.has(c):
+				seen[c] = true
+				out.append(c)
+		else:
+			for c in _brush_cells(p):
+				if not seen.has(c):
+					seen[c] = true
+					out.append(c)
+	return out
+
+
+func _emit() -> void:
+	App.layer_cells_changed.emit(_layer.id)
+
+
+# ---- event entry points ----------------------------------------------------
+
+func press(p: Vector2, right_button: bool, mods: Dictionary) -> void:
+	_layer = App.active_layer()
+	if _layer == null:
+		return
+	_frame = App.frame
+	_mods = mods
+	erase = right_button
+	_tool = App.tool
+	if right_button and _tool in ["eyedropper", "fill", "line", "rect", "ellipse", "move", "select_rect", "lasso", "wand", "arrow", "curve", "bezier", "dir_edit"]:
+		_tool = "eraser"  # right button always erases
+	if _tool == "pencil" and mods.get("alt", false):
+		_tool = "eyedropper"
+	active = true
+	start = p
+	last = p
+	current = p
+	if _layer.is_direction():
+		_direction_press(p, mods)
+		return
+	if _tool in DIR_TOOLS:
+		active = false
+		App.status.emit("Direction tools draw on direction layers (+ Dir in Layers)")
+		return
+	_t()  # normalises the layer's cell arrays to its tiling before snapshotting
+	_before = _layer.cells(_frame).duplicate()
+	match _tool:
+		"pencil", "eraser":
+			if _tool == "eraser":
+				erase = true
+			if not _can_edit():
+				active = false
+				App.status.emit("Layer is locked or hidden")
+				return
+			var data := _layer.cells(_frame)
+			_apply_mirrored(_brush_cells(p), _value(), data)
+			_emit()
+		"eyedropper":
+			_pick(p)
+		"fill":
+			if _can_edit():
+				_fill(p)
+			active = false
+		"lasso":
+			lasso = PackedVector2Array([p])
+		"wand":
+			_wand(p)
+			active = false
+		"move":
+			if not _can_edit():
+				active = false
+				return
+			_lift()
+		"line", "rect", "ellipse":
+			if not _can_edit():
+				active = false
+				App.status.emit("Layer is locked or hidden")
+
+
+func drag(p: Vector2, mods: Dictionary) -> void:
+	if not active or _layer == null:
+		return
+	_mods = mods
+	current = p
+	if _layer.is_direction():
+		_direction_drag(p)
+		return
+	match _tool:
+		"pencil", "eraser":
+			var data := _layer.cells(_frame)
+			_apply_mirrored(_segment_cells(last, p), _value(), data)
+			last = p
+			_emit()
+		"eyedropper":
+			_pick(p)
+		"line", "rect", "ellipse":
+			_preview_shape()
+		"lasso":
+			if lasso.is_empty() or lasso[lasso.size() - 1].distance_to(p) > 0.5:
+				lasso.append(p)
+		"move":
+			_move_preview()
+		"select_rect":
+			pass
+
+
+func release(p: Vector2, mods: Dictionary) -> void:
+	if not active or _layer == null:
+		active = false
+		return
+	_mods = mods
+	current = p
+	active = false
+	if _layer.is_direction():
+		_direction_release()
+		return
+	match _tool:
+		"pencil", "eraser":
+			App.commit_cells("Erase" if erase else "Draw", _layer, _frame, _before)
+		"line", "rect", "ellipse":
+			_preview_shape()
+			App.commit_cells(ToolController.TOOLS[_tool].name, _layer, _frame, _before)
+		"select_rect":
+			var r := Rect2(start, Vector2.ZERO).expand(p)
+			_combine_selection(_t().cells_in_rect(r))
+		"lasso":
+			lasso.append(p)
+			_combine_selection(_t().cells_in_polygon(lasso))
+			lasso = PackedVector2Array()
+		"move":
+			_move_preview()
+			_finish_move()
+
+
+func cancel() -> void:
+	if active and _layer and _tool in ["pencil", "eraser", "line", "rect", "ellipse", "move"] and not _layer.is_direction():
+		_layer.set_cells(_frame, _before.duplicate())
+		_emit()
+	active = false
+	lasso = PackedVector2Array()
+
+
+# ---- individual tools ------------------------------------------------------
+
+func _pick(p: Vector2) -> void:
+	var t := _t()
+	var c := t.point_to_cell(_wrap(p))
+	if t.in_grid(c):
+		var v := _layer.cells(_frame)[t.index(c)]
+		if v > 0:
+			App.set_color(v)
+
+
+func _constrained_end() -> Vector2:
+	var d := current - start
+	if _mods.get("shift", false):
+		if _tool == "line":
+			var step := deg_to_rad(_t().rotation_step_deg() * 0.5)
+			var a := roundf(d.angle() / step) * step
+			return start + Vector2.from_angle(a) * d.length()
+		var m := maxf(absf(d.x), absf(d.y))
+		return start + Vector2(signf(d.x) * m if d.x != 0 else m, signf(d.y) * m if d.y != 0 else m)
+	return current
+
+
+func shape_rect() -> Rect2:
+	var e := _constrained_end()
+	if _mods.get("ctrl", false):
+		var half := e - start
+		return Rect2(start - half.abs(), half.abs() * 2.0)
+	return Rect2(start, Vector2.ZERO).expand(e)
+
+
+func _preview_shape() -> void:
+	var data := _before.duplicate()
+	var t := _t()
+	var cells: Array[Vector2i] = []
+	var filled: bool = App.tool_opts.filled
+	match _tool:
+		"line":
+			cells = _segment_cells(start, _constrained_end())
+		"rect":
+			var r := shape_rect()
+			if filled:
+				for off in _wrap_offsets():
+					cells.append_array(t.cells_in_rect(Rect2(r.position + off, r.size)))
+			else:
+				var a := r.position
+				var b := r.end
+				for seg in [[a, Vector2(b.x, a.y)], [Vector2(b.x, a.y), b], [b, Vector2(a.x, b.y)], [Vector2(a.x, b.y), a]]:
+					cells.append_array(_segment_cells(seg[0], seg[1]))
+		"ellipse":
+			var r := shape_rect()
+			var ctr := r.get_center()
+			var radii := r.size * 0.5
+			if filled:
+				for off in _wrap_offsets():
+					cells.append_array(t.cells_in_ellipse(ctr + off, radii))
+			else:
+				var perim := TAU * sqrt((radii.x * radii.x + radii.y * radii.y) * 0.5)
+				var n := maxi(12, int(perim / maxf(t.inradius(), 0.5)))
+				var prev := ctr + Vector2(radii.x, 0)
+				for i in range(1, n + 1):
+					var a := TAU * i / n
+					var q := ctr + Vector2(cos(a) * radii.x, sin(a) * radii.y)
+					cells.append_array(_segment_cells(prev, q))
+					prev = q
+	_apply_mirrored(cells, _value(), data)
+	_layer.set_cells(_frame, data)
+	_emit()
+
+
+func _match_table(target: int, tol: float) -> PackedByteArray:
+	# Which cell values count as "the same colour" (OKLab distance on the
+	# palette, so this is per palette entry, not per cell).
+	var table := PackedByteArray()
+	table.resize(256)
+	var pal := App.project.palette
+	for v in 256:
+		if v == target:
+			table[v] = 1
+		elif tol > 0.0 and v > 0 and target > 0 and v <= pal.size() and target <= pal.size():
+			table[v] = 1 if OkLab.distance(pal[v - 1], pal[target - 1]) <= tol else 0
+	return table
+
+
+func _region(seed: Vector2i, data: PackedByteArray, table: PackedByteArray, global: bool) -> PackedInt32Array:
+	var t := _t()
+	var out := PackedInt32Array()
+	if global:
+		for i in data.size():
+			if table[data[i]] == 1:
+				out.append(i)
+		return out
+	var seen := PackedByteArray()
+	seen.resize(data.size())
+	var stack: Array[Vector2i] = [seed]
+	seen[t.index(seed)] = 1
+	while not stack.is_empty():
+		var c: Vector2i = stack.pop_back()
+		out.append(t.index(c))
+		for n in t.neighbors(c):
+			var ni := t.index(n)
+			if seen[ni] == 0 and table[data[ni]] == 1:
+				seen[ni] = 1
+				stack.append(n)
+	return out
+
+
+func _fill(p: Vector2) -> void:
+	var t := _t()
+	var data := _layer.cells(_frame)
+	var global: bool = App.tool_opts.fill_global or _mods.get("shift", false)
+	var tol: float = App.tool_opts.tolerance
+	var v := _value()
+	var sel := App.has_selection()
+	for m in _mirrors():
+		var c := t.point_to_cell(_wrap(m * p))
+		if not t.in_grid(c):
+			continue
+		var target := data[t.index(c)]
+		if target == v and tol <= 0.0:
+			continue
+		var region := _region(c, data, _match_table(target, tol), global)
+		for i in region:
+			if not sel or (i < App.selection.size() and App.selection[i] != 0):
+				data[i] = v
+	_emit()
+	App.commit_cells("Fill", _layer, _frame, _before)
+
+
+func _wand(p: Vector2) -> void:
+	var t := _t()
+	var c := t.point_to_cell(_wrap(p))
+	if not t.in_grid(c):
+		if not _mods.get("shift", false) and not _mods.get("ctrl", false):
+			App.clear_selection()
+		return
+	var data := _layer.cells(_frame)
+	var global: bool = App.tool_opts.wand_global or _mods.get("alt", false)
+	var region := _region(c, data, _match_table(data[t.index(c)], App.tool_opts.wand_tolerance), global)
+	var cells: Array[Vector2i] = []
+	for i in region:
+		cells.append(t.cell_of_index(i))
+	_combine_selection(cells)
+
+
+func _combine_selection(cells: Array[Vector2i]) -> void:
+	var t := _t()
+	var mask: PackedByteArray
+	var add: bool = _mods.get("shift", false)
+	var sub: bool = _mods.get("ctrl", false)
+	if (add or sub) and App.has_selection():
+		mask = App.selection.duplicate()
+	else:
+		mask = PackedByteArray()
+	mask.resize(t.cell_count())
+	for c in cells:
+		if t.in_grid(c):
+			mask[t.index(c)] = 0 if sub else 255
+	App.set_selection(mask)
+
+
+# ---- move ------------------------------------------------------------------
+
+func _lift() -> void:
+	var t := _t()
+	_lifted.clear()
+	var data := _before
+	var sel := App.has_selection()
+	var sum := Vector2.ZERO
+	for i in data.size():
+		if data[i] == 0:
+			continue
+		if sel and (i >= App.selection.size() or App.selection[i] == 0):
+			continue
+		var ctr := t.cell_center(t.cell_of_index(i))
+		_lifted.append([ctr, data[i]])
+		sum += ctr
+	if _lifted.is_empty():
+		active = false
+		return
+	_lift_ref = _lifted[0][0]
+
+
+func _snapped_offset() -> Vector2:
+	# Snap to a lattice translation so every lifted cell lands on a cell.
+	var t := _t()
+	var raw := current - start
+	var target := t.point_to_cell(_lift_ref + raw)
+	if target == Tiling.INVALID:
+		return raw
+	return t.cell_center(target) - _lift_ref
+
+
+func _move_preview() -> void:
+	var t := _t()
+	var data := _before.duplicate()
+	var copy: bool = _mods.get("alt", false)
+	if not copy:
+		for e in _lifted:
+			var c := t.point_to_cell(e[0])
+			if t.in_grid(c):
+				data[t.index(c)] = 0
+	var off := _snapped_offset()
+	for e in _lifted:
+		var c := t.point_to_cell(_wrap(e[0] + off))
+		if t.in_grid(c):
+			data[t.index(c)] = e[1]
+	_layer.set_cells(_frame, data)
+	_emit()
+
+
+func _finish_move() -> void:
+	var t := _t()
+	if App.has_selection():
+		var off := _snapped_offset()
+		var mask := PackedByteArray()
+		mask.resize(t.cell_count())
+		for e in _lifted:
+			var c := t.point_to_cell(_wrap(e[0] + off))
+			if t.in_grid(c):
+				mask[t.index(c)] = 255
+		App.set_selection(mask)
+	App.commit_cells("Move", _layer, _frame, _before)
+
+
+# ---- direction layer ---------------------------------------------------------
+
+var _bez_a := PackedVector2Array()  # pending Bezier anchors
+var _bez_o := PackedVector2Array()  # their out-handles (in-handles mirror them)
+var _edit_idx := -1                # point index being dragged (-1 = whole stroke)
+var _edit_from: Dictionary = {}
+
+
+func _dir_settings() -> Dictionary:
+	var d := DirStroke.DEFAULT_SETTINGS.duplicate()
+	d.merge(_layer.settings.get("dir", {}), true)
+	return d
+
+
+func _strokes() -> Array:
+	return _layer.strokes_at(App.frame)
+
+
+func _new_stroke(kind: String, pts: PackedVector2Array) -> Dictionary:
+	var ds := _dir_settings()
+	var type: String = DirStroke.TYPES[int(ds.new_type)]
+	var radius := float(ds.new_radius) * App.project.cell_size
+	if kind != "arrow":
+		type = "path"
+	if type != "path" and radius <= 0.0 and pts.size() > 1:
+		radius = pts[0].distance_to(pts[1]) * 2.0
+	return DirStroke.make(kind, type, pts, radius, float(ds.new_strength))
+
+
+func _add_stroke(st: Dictionary, label: String) -> void:
+	var lid := _layer.id
+	var f := App.frame
+	App.perform(label, func():
+		var l := App.project.layer_by_id(lid)
+		l.strokes_at(f).append(st)
+		App.dir_selected = l.strokes_at(f).size() - 1)
+
+
+func _stroke_at(p: Vector2) -> int:
+	var best := -1
+	var bd := App.project.cell_size * 1.5
+	var arr := _strokes()
+	for i in arr.size():
+		var d := DirStroke.distance_to(arr[i], p)
+		if d < bd:
+			bd = d
+			best = i
+	return best
+
+
+func _direction_press(p: Vector2, mods: Dictionary) -> void:
+	if _layer.locked:
+		active = false
+		return
+	if erase or _tool == "eraser":
+		var i := _stroke_at(p)
+		active = false
+		if i >= 0:
+			var lid := _layer.id
+			var f := App.frame
+			App.perform("Delete stroke", func():
+				App.project.layer_by_id(lid).strokes_at(f).remove_at(i)
+				App.dir_selected = -1)
+		return
+	match _tool:
+		"arrow":
+			_stroke = PackedVector2Array([p, p])
+		"pencil", "curve":
+			_stroke = PackedVector2Array([p])
+		"bezier":
+			_bez_a.append(p)
+			_bez_o.append(p)
+			if mods.get("double", false):
+				finish_bezier()
+				active = false
+		"dir_edit":
+			var i := _stroke_at(p)
+			App.dir_selected = i
+			App.selection_changed.emit()
+			if i < 0:
+				active = false
+				return
+			var st: Dictionary = _strokes()[i]
+			_edit_idx = -1
+			var bd := App.project.cell_size * 0.9
+			var pts: PackedVector2Array = st.points
+			for k in pts.size():
+				if pts[k].distance_to(p) < bd:
+					bd = pts[k].distance_to(p)
+					_edit_idx = k
+			_edit_from = st.duplicate()
+			_edit_from.points = pts.duplicate()
+			App.begin_change()
+		_:
+			active = false
+
+
+func _direction_drag(p: Vector2) -> void:
+	match _tool:
+		"arrow":
+			if _stroke.size() == 2:
+				_stroke[1] = p
+		"pencil", "curve":
+			if _stroke.size() > 0 and _stroke[_stroke.size() - 1].distance_to(p) >= App.project.cell_size * 0.5:
+				_stroke.append(p)
+		"bezier":
+			if not _bez_o.is_empty():
+				_bez_o[_bez_o.size() - 1] = p
+		"dir_edit":
+			var i: int = App.dir_selected
+			if i < 0 or i >= _strokes().size():
+				return
+			var st: Dictionary = _strokes()[i]
+			var src: PackedVector2Array = _edit_from.points
+			var pts := src.duplicate()
+			var dlt := p - start
+			if _edit_idx < 0:
+				for k in pts.size():
+					pts[k] = src[k] + dlt
+			else:
+				pts[_edit_idx] = src[_edit_idx] + dlt
+				# Moving a Bezier anchor carries its handles along.
+				if st.kind == "bezier" and _edit_idx % 3 == 0:
+					for h in [_edit_idx - 1, _edit_idx + 1]:
+						if h >= 0 and h < pts.size():
+							pts[h] = src[h] + dlt
+			st.points = pts
+
+
+func _direction_release() -> void:
+	match _tool:
+		"arrow":
+			if _stroke.size() == 2 and _stroke[0].distance_to(_stroke[1]) > 2.0:
+				_add_stroke(_new_stroke("arrow", _stroke), "Draw arrow")
+		"pencil", "curve":
+			if _stroke.size() >= 2:
+				_add_stroke(_new_stroke("curve", _stroke), "Draw curve")
+		"dir_edit":
+			App.end_change("Edit stroke")
+	_stroke = PackedVector2Array()
+
+
+func _bez_points() -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	for i in _bez_a.size():
+		if i > 0:
+			pts.append(_bez_o[i - 1])
+			pts.append(_bez_a[i] * 2.0 - _bez_o[i])
+		pts.append(_bez_a[i])
+	return pts
+
+
+## Completes the pending Bezier stroke (Enter, double-click or tool change).
+func finish_bezier() -> void:
+	if _bez_a.size() >= 2 and _layer and _layer.is_direction():
+		_add_stroke(_new_stroke("bezier", _bez_points()), "Draw Bezier")
+	_bez_a = PackedVector2Array()
+	_bez_o = PackedVector2Array()
+
+
+func pending_stroke() -> PackedVector2Array:
+	if _bez_a.size() >= 2:
+		return DirStroke.polyline({"kind": "bezier", "points": _bez_points()})
+	return _stroke
+
+
+## Anchors and handles of the Bezier being drawn (overlay).
+func pending_bezier() -> Array:
+	return [_bez_a, _bez_o]
